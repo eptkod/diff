@@ -184,7 +184,9 @@ impl Engine {
         let running = next.setup_complete && self.status() != Status::Paused;
         if running && previous.capture_differs(&next) {
             self.start();
-        } else if running && previous.voice_enabled != next.voice_enabled {
+        } else if running
+            && (previous.voice_enabled != next.voice_enabled || previous.voice_model != next.voice_model)
+        {
             self.restart_microphone(&next);
         }
         Ok(())
@@ -433,7 +435,7 @@ impl Engine {
 
         // A voice problem must not take microphone-in-clips down with it.
         let spotter = if settings.voice_enabled {
-            match VoiceSpotter::new(&self.voice_model_dir) {
+            match VoiceSpotter::new(&self.voice_model_dir, settings.voice_model) {
                 Ok(spotter) => Some(spotter),
                 Err(error) => {
                     self.set_voice_issue(Some(format!("Voice clipping is off: {error}.")));

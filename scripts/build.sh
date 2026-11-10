@@ -27,7 +27,10 @@ build_dmg() {
   ditto "$BUILDS/diff.app" "$staging/diff.app"
   # Lets people drag diff straight into Applications.
   ln -s /Applications "$staging/Applications"
-  hdiutil create -volname diff -srcfolder "$staging" -ov -format UDZO "$BUILDS/diff.dmg"
+  # hdiutil's own size guess is too small for the large voice model files.
+  local size_mb
+  size_mb=$(( $(du -sm "$staging" | cut -f1) * 3 / 2 + 20 ))
+  hdiutil create -volname diff -srcfolder "$staging" -size "${size_mb}m" -ov -format UDZO "$BUILDS/diff.dmg"
   rm -rf "${staging:?}"
   echo "Built: $BUILDS/diff.dmg"
 }

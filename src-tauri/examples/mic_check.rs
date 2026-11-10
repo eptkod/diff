@@ -1,11 +1,13 @@
 //! Opens the microphone and reports what it heard.
-//! Usage: cargo run --example mic_check -- [voice model dir]
+//! Usage: cargo run --example mic_check -- [voice models dir]
+//! Set VOICE_MODEL=light to listen with the light model.
 //! With a model folder, also records system audio and, for 20 seconds, reports
 //! each trigger phrase and whether it was rejected as coming from the speakers.
 
 use diff_lib::audio::{MicQueue, Microphone};
 use diff_lib::capture::{new_recording, Capture, CaptureBackend, CaptureConfig, CaptureEvents};
 use diff_lib::echo::EchoGuard;
+use diff_lib::settings::VoiceModel;
 use diff_lib::voice::VoiceSpotter;
 use std::path::Path;
 use std::sync::Arc;
@@ -33,7 +35,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let events = CaptureEvents { on_source_lost: Arc::new(|| {}) };
             let capture = Capture::start(&config, new_recording(5_000_000, 64 << 20), events)?;
 
-            let mut spotter = VoiceSpotter::new(Path::new(&model))?;
+            let mut spotter = VoiceSpotter::new(Path::new(&model), voice_model())?;
             let start = Instant::now();
             while start.elapsed() < LISTEN {
                 if let Ok(chunk) = audio.recv_timeout(Duration::from_millis(200)) {
@@ -52,4 +54,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     drop(microphone);
     println!("heard a signal: {}", queue.heard_signal());
     Ok(())
+}
+
+fn voice_model() -> VoiceModel {
+    let light = std::env::var("VOICE_MODEL").as_deref() == Ok("light");
+    if light { VoiceModel::Light } else { VoiceModel::Accurate }
 }

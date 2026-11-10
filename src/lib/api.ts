@@ -10,11 +10,14 @@ export type Source = ListedSource | { kind: "activeWindow" };
 
 export type Quality = "low" | "medium" | "high";
 
+export type VoiceModel = "light" | "accurate";
+
 export interface Settings {
   source: Source | null;
   clipSeconds: number;
   hotkey: string;
   voiceEnabled: boolean;
+  voiceModel: VoiceModel;
   includeMic: boolean;
   quality: Quality;
   saveFolder: string;
@@ -59,6 +62,19 @@ export const QUALITIES: { id: Quality; label: string; detail: string; bitrate: n
   { id: "low", label: "Low", detail: "720p, 30 fps", bitrate: 5_000_000 },
   { id: "medium", label: "Medium", detail: "1080p, 30 fps", bitrate: 10_000_000 },
   { id: "high", label: "High", detail: "1080p, 60 fps", bitrate: 15_000_000 },
+];
+
+export const VOICE_MODELS: { id: VoiceModel; label: string; detail: string }[] = [
+  {
+    id: "accurate",
+    label: "Accurate",
+    detail: "Hears quiet and misheard commands much more reliably. Uses about 200 MB more memory, and a little processing after you speak.",
+  },
+  {
+    id: "light",
+    label: "Light",
+    detail: "Uses almost no memory or processing, but often needs a clear voice close to the microphone.",
+  },
 ];
 
 export const api = {

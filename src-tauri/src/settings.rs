@@ -47,6 +47,15 @@ impl Quality {
     }
 }
 
+/// Which detector listens for the voice command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum VoiceModel {
+    Light,
+    #[default]
+    Accurate,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -55,6 +64,7 @@ pub struct Settings {
     pub clip_seconds: u32,
     pub hotkey: String,
     pub voice_enabled: bool,
+    pub voice_model: VoiceModel,
     pub include_mic: bool,
     pub quality: Quality,
     pub save_folder: PathBuf,
@@ -69,6 +79,7 @@ impl Default for Settings {
             clip_seconds: DEFAULT_CLIP_SECONDS,
             hotkey: "Alt+Shift+KeyC".into(),
             voice_enabled: true,
+            voice_model: VoiceModel::default(),
             include_mic: true,
             quality: Quality::High,
             save_folder: PathBuf::new(),
@@ -182,6 +193,14 @@ mod tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, r#"{"clipSeconds": 17}"#).unwrap();
         assert_eq!(Settings::load(&path, Path::new("/v")).clip_seconds, 30);
+    }
+
+    #[test]
+    fn settings_saved_before_voice_models_existed_use_the_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"clipSeconds": 60}"#).unwrap();
+        assert_eq!(Settings::load(&path, Path::new("/v")).voice_model, VoiceModel::Accurate);
     }
 
     #[test]

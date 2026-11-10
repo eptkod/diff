@@ -1,7 +1,10 @@
 //! Counts trigger detections for each 16 kHz mono WAV listed on the command line.
-//! Usage: cargo run --example voice_eval -- <model dir> <wav>...
-//! Set VOICE_SCORE and VOICE_THRESHOLD to try other sensitivities.
+//! Usage: cargo run --example voice_eval -- <voice models dir> <wav>...
+//! Set VOICE_MODEL to light or accurate (the default). For the light model,
+//! set VOICE_SCORE and VOICE_THRESHOLD to try other sensitivities, and
+//! VOICE_KEYWORDS to the path of a keywords file to try other phrases.
 
+use diff_lib::settings::VoiceModel;
 use diff_lib::voice::{VoiceSpotter, VOICE_SAMPLE_RATE};
 use std::path::Path;
 
@@ -16,10 +19,18 @@ fn read_samples(path: &str) -> Vec<f32> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let root = Path::new(&args[0]);
+    let light = std::env::var("VOICE_MODEL").as_deref() == Ok("light");
     let setting = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
-    let mut spotter = match (setting("VOICE_SCORE"), setting("VOICE_THRESHOLD")) {
-        (Some(score), Some(threshold)) => VoiceSpotter::with_tuning(Path::new(&args[0]), score, threshold),
-        _ => VoiceSpotter::new(Path::new(&args[0])),
+    let mut spotter = match (light, setting("VOICE_SCORE"), setting("VOICE_THRESHOLD")) {
+        (true, Some(score), Some(threshold)) => {
+            let keywords = std::env::var("VOICE_KEYWORDS")
+                .ok()
+                .map(|path| std::fs::read_to_string(path).expect("readable keywords"));
+            VoiceSpotter::light_with_tuning(&root.join("light"), score, threshold, keywords)
+        }
+        (true, _, _) => VoiceSpotter::new(root, VoiceModel::Light),
+        (false, _, _) => VoiceSpotter::new(root, VoiceModel::Accurate),
     }
     .expect("model loads");
     let chunk = VOICE_SAMPLE_RATE / 10;

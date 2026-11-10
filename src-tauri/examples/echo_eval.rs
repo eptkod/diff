@@ -1,7 +1,9 @@
 //! Measures echo rejection. For each phrase, simulates the microphone hearing
 //! it from the speakers, then checks whether a detection would be rejected.
-//! Usage: cargo run --example echo_eval -- <model dir> <phrase wavs dir> <other speech dir>...
+//! Usage: cargo run --example echo_eval -- <voice models dir> <phrase wavs dir> <other speech dir>...
+//! Set VOICE_MODEL=light to test the light model.
 
+use diff_lib::settings::VoiceModel;
 use diff_lib::voice::{VoiceSpotter, VOICE_SAMPLE_RATE};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -58,7 +60,9 @@ fn detected(spotter: &mut VoiceSpotter, audio: &[f32]) -> bool {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let mut spotter = VoiceSpotter::new(Path::new(&args[0])).expect("model loads");
+    let light = std::env::var("VOICE_MODEL").as_deref() == Ok("light");
+    let model = if light { VoiceModel::Light } else { VoiceModel::Accurate };
+    let mut spotter = VoiceSpotter::new(Path::new(&args[0]), model).expect("model loads");
 
     for (gain, label) in [(1.5, "loud speakers"), (0.8, "normal speakers")] {
         let (mut heard, mut rejected, mut total) = (0, 0, 0);

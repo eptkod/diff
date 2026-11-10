@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, CLIP_LENGTHS, errorText, formatHotkey, formatLength, hotkeyFromEvent, isMac, QUALITIES, type Settings } from "$lib/api";
+  import { api, CLIP_LENGTHS, errorText, formatHotkey, formatLength, hotkeyFromEvent, isMac, QUALITIES, VOICE_MODELS, type Settings } from "$lib/api";
   import SourcePicker from "$lib/SourcePicker.svelte";
 
   let {
@@ -85,6 +85,20 @@
     onchange={(e) => update({ voiceEnabled: (e.target as HTMLInputElement).checked })}
   />
 </label>
+
+{#if settings.voiceEnabled}
+  <div class="field">
+    <span class="label">Voice detection</span>
+    <div class="segments">
+      {#each VOICE_MODELS as model}
+        <button aria-pressed={settings.voiceModel === model.id} onclick={() => update({ voiceModel: model.id })}>
+          {model.label}
+        </button>
+      {/each}
+    </div>
+    <p class="hint">{VOICE_MODELS.find((m) => m.id === settings.voiceModel)?.detail}</p>
+  </div>
+{/if}
 
 <label class="toggle">
   <span>
