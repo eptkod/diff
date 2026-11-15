@@ -2,7 +2,10 @@
 //! Usage: cargo run --example voice_eval -- <voice models dir> <wav>...
 //! Set VOICE_MODEL to light or accurate (the default). For the light model,
 //! set VOICE_SCORE and VOICE_THRESHOLD to try other sensitivities, and
-//! VOICE_KEYWORDS to the path of a keywords file to try other phrases.
+//! VOICE_KEYWORDS to the path of a keywords file to try other phrases. For
+//! the accurate model, set VOICE_SCORE to try another lean towards the
+//! phrases. VOICE_WIDTH tries another search width with either model, when
+//! the other settings for that model are given too.
 
 use diff_lib::settings::VoiceModel;
 use diff_lib::voice::{VoiceSpotter, VOICE_SAMPLE_RATE};
@@ -22,14 +25,19 @@ fn main() {
     let root = Path::new(&args[0]);
     let light = std::env::var("VOICE_MODEL").as_deref() == Ok("light");
     let setting = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<f32>().ok());
+    let width = setting("VOICE_WIDTH").map_or(16, |width| width as i32);
     let mut spotter = match (light, setting("VOICE_SCORE"), setting("VOICE_THRESHOLD")) {
         (true, Some(score), Some(threshold)) => {
             let keywords = std::env::var("VOICE_KEYWORDS")
                 .ok()
                 .map(|path| std::fs::read_to_string(path).expect("readable keywords"));
-            VoiceSpotter::light_with_tuning(&root.join("light"), score, threshold, keywords)
+            let dir = root.join("light");
+            VoiceSpotter::light_with_tuning(&dir, score, threshold, width, keywords)
         }
         (true, _, _) => VoiceSpotter::new(root, VoiceModel::Light),
+        (false, Some(boost), _) => {
+            VoiceSpotter::accurate_with_tuning(&root.join("accurate"), boost, width)
+        }
         (false, _, _) => VoiceSpotter::new(root, VoiceModel::Accurate),
     }
     .expect("model loads");

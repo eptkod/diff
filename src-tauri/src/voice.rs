@@ -1,11 +1,12 @@
 //! On-device detection of the "diff clip that" phrases.
 //!
 //! There are two detectors. The light one is a small keyword spotter that
-//! follows the audio as it arrives. The accurate one transcribes each stretch
-//! of speech with a larger model once it can hear the whole phrase, then
-//! compares how the end of it sounds with the trigger phrases. Audio is held
-//! in memory only as long as detection needs it, and is never saved or sent
-//! anywhere.
+//! follows the audio as it arrives. The accurate one reads each stretch of
+//! speech with a larger model once it can hear the whole phrase. That model
+//! is told to expect the trigger phrases, so it writes one out whenever the
+//! sound fits, and only those exact words at the end of the speech count.
+//! Audio is held in memory only as long as detection needs it, and is never
+//! saved or sent anywhere.
 
 use crate::settings::VoiceModel;
 use sherpa_onnx::{
@@ -37,6 +38,8 @@ const ECHO_TRAILING_SILENCE: usize = VOICE_SAMPLE_RATE;
 
 const KEYWORDS_SCORE: f32 = 3.0;
 const KEYWORDS_THRESHOLD: f32 = 0.05;
+/// How many readings of the audio the light model keeps open at once.
+const KEYWORDS_SEARCH_WIDTH: i32 = 16;
 
 /// Lowest RMS level that can count as speech, whatever the room sounds like.
 const MIN_SPEECH_LEVEL: f32 = 0.0008;
@@ -60,17 +63,36 @@ const LEVEL_FRAME_SAMPLES: usize = VOICE_SAMPLE_RATE / 40;
 const LEVEL_ATTACK_SECONDS: f32 = 0.015;
 const LEVEL_RELEASE_SECONDS: f32 = 1.0;
 
-/// How the end of a trigger phrase sounds once reduced to consonants: "diff
-/// clip that" (or "it") and "diff save that".
-const TRIGGER_SOUNDS: [&str; 2] = ["dfklpt", "dfsft"];
-/// "Diff" is short and easily misheard, so some difference has to be allowed.
-const MAX_SOUND_DIFFERENCE: usize = 2;
-/// Stricter for the computer's own sound, which is checked anywhere in what
-/// it said: allowing more would mistake ordinary speech from a game or call
-/// for the phrase, and ignore a command spoken over it.
-const ECHO_SOUND_DIFFERENCE: usize = 1;
-/// The longest run of words that can make up a phrase, including "hey".
-const MAX_PHRASE_WORDS: usize = 5;
+/// The trigger phrases as the accurate model writes them. "Clipped" and
+/// "saved" are included because they sound the same as "clip" and "save" when
+/// "that" or "it" follows. "Hey diff clip that" ends with the first phrase.
+const PHRASES: [&str; 6] = [
+    "DIFF CLIP THAT",
+    "DIFF CLIP IT",
+    "DIFF SAVE THAT",
+    "DIFF CLIPPED THAT",
+    "DIFF CLIPPED IT",
+    "DIFF SAVED THAT",
+];
+/// How far the accurate model leans towards hearing a trigger phrase. "Diff"
+/// isn't a word it knows, so without this it writes "if" or "they've". Higher
+/// catches more unclear speech, and mistakes more similar speech for a phrase.
+const PHRASE_BOOST: f32 = 3.5;
+/// How many readings of the audio the accurate model keeps open at once. A
+/// phrase that starts as the less likely reading needs room to win later.
+const SEARCH_WIDTH: i32 = 16;
+/// The lean used when asking "was the computer saying this?". Stronger, since
+/// missing a phrase there lets a replayed clip trigger a new one.
+const ECHO_PHRASE_BOOST: f32 = 7.0;
+/// The most audio the accurate model is given at once. It fails outright on
+/// much more than this, and nothing the app listens to is as long.
+const MAX_READ_SAMPLES: usize = VOICE_SAMPLE_RATE * 15;
+/// Sound after a phrase counts as background, such as other people talking,
+/// if it's at most this fraction of the phrase's own level.
+const BACKGROUND_LEVEL: f32 = 0.5;
+/// After a pause, a second read covers only this much of the latest speech.
+/// With less before it to account for, the model hears a phrase more easily.
+const CLOSE_READ_SAMPLES: usize = VOICE_SAMPLE_RATE * 9 / 5;
 
 /// How much recent speech the accurate model reads each time.
 const WINDOW_SAMPLES: usize = VOICE_SAMPLE_RATE * 7 / 2;
@@ -87,19 +109,24 @@ pub enum VoiceError {
     ModelUnavailable,
 }
 
-/// Scales a whole stretch of audio so its speech is at the target level,
-/// judged by its louder parts so pauses don't drag the estimate down.
-fn normalize_speech(audio: &mut [f32]) {
+/// The level of the speech in a stretch of audio, judged by its louder parts
+/// so pauses don't drag the estimate down.
+fn speech_level(audio: &[f32]) -> f32 {
     let mut energies: Vec<f32> = audio
         .chunks(LEVEL_FRAME_SAMPLES)
         .map(|frame| frame.iter().map(|s| s * s).sum::<f32>() / frame.len() as f32)
         .collect();
     if energies.is_empty() {
-        return;
+        return 0.0;
     }
     energies.sort_by(f32::total_cmp);
     let loud = &energies[energies.len() / 3..];
-    let level = (loud.iter().sum::<f32>() / loud.len() as f32).sqrt();
+    (loud.iter().sum::<f32>() / loud.len() as f32).sqrt()
+}
+
+/// Scales a whole stretch of audio so its speech is at the target level.
+fn normalize_speech(audio: &mut [f32]) {
+    let level = speech_level(audio);
     if level <= 0.0 {
         return;
     }
@@ -236,76 +263,77 @@ fn rms(samples: &[f32]) -> f32 {
     (samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32).sqrt()
 }
 
-fn sound_skeleton(text: &str) -> String {
-    let mut key = text.to_lowercase();
-    for (from, to) in [
-        ("ph", "f"),
-        ("ck", "k"),
-        ("th", "t"),
-        ("q", "k"),
-        ("c", "k"),
-        ("v", "f"),
-        ("z", "s"),
-        ("x", "ks"),
-    ] {
-        key = key.replace(from, to);
-    }
-    let mut skeleton = String::with_capacity(key.len());
-    for letter in key.chars() {
-        if skeleton.ends_with(letter) {
-            continue;
-        }
-        if skeleton.is_empty() || !"aeiouy".contains(letter) {
-            skeleton.push(letter);
-        }
-    }
-    skeleton
+/// A word the accurate model heard, and when it started.
+#[derive(Debug, Clone, PartialEq)]
+struct Word {
+    text: String,
+    start_seconds: f32,
 }
 
-fn edit_distance(a: &str, b: &str) -> usize {
-    let b: Vec<char> = b.chars().collect();
-    let mut previous: Vec<usize> = (0..=b.len()).collect();
-    for (row, letter) in a.chars().enumerate() {
-        let mut current = vec![row + 1];
-        for (column, other) in b.iter().enumerate() {
-            current.push(
-                (previous[column + 1] + 1)
-                    .min(current[column] + 1)
-                    .min(previous[column] + usize::from(letter != *other)),
-            );
+/// Joins the model's pieces of words back into words. A piece that starts a
+/// word is marked with a leading space or underline.
+fn words_from_tokens(tokens: &[String], times: &[f32]) -> Vec<Word> {
+    let mut words: Vec<Word> = Vec::new();
+    for (index, token) in tokens.iter().enumerate() {
+        let piece = token.trim_start_matches([' ', '\u{2581}']);
+        match words.last_mut() {
+            Some(word) if piece.len() == token.len() => word.text.push_str(piece),
+            _ => words.push(Word {
+                text: piece.to_string(),
+                start_seconds: times.get(index).copied().unwrap_or(0.0),
+            }),
         }
-        previous = current;
     }
-    previous[b.len()]
+    words.retain(|word| !word.text.is_empty());
+    words
 }
 
-fn sounds_like_trigger(words: &str, max_difference: usize) -> bool {
-    let sound = sound_skeleton(words);
-    TRIGGER_SOUNDS.iter().any(|target| {
-        // Stops "clip that" alone from counting once "diff" has been forgiven.
-        sound.len() + 1 >= target.len() && edit_distance(&sound, target) <= max_difference
-    })
+/// Where each trigger phrase in `words` starts and ends, as word positions.
+/// Only whole words count: "cardiff clip that" isn't a phrase.
+fn phrase_positions(words: &[Word]) -> Vec<(usize, usize)> {
+    let mut found = Vec::new();
+    for phrase in PHRASES {
+        let phrase: Vec<&str> = phrase.split(' ').collect();
+        for (start, run) in words.windows(phrase.len()).enumerate() {
+            let matches = run
+                .iter()
+                .zip(&phrase)
+                .all(|(word, expected)| word.text.eq_ignore_ascii_case(expected));
+            if matches {
+                found.push((start, start + phrase.len()));
+            }
+        }
+    }
+    found.sort_unstable();
+    found
 }
 
-/// True if a transcript contains a trigger phrase. With `at_end`, the phrase
-/// has to finish the transcript, as a spoken command does; "I did clip that
-/// yesterday" doesn't.
-fn transcript_has_trigger(
-    text: &str,
-    at_end: bool,
-    max_words: usize,
-    max_difference: usize,
-) -> bool {
-    let lowered = text.to_lowercase();
-    let words: Vec<&str> = lowered
-        .split(|letter: char| !letter.is_ascii_lowercase())
-        .filter(|word| !word.is_empty())
-        .collect();
-    (1..=max_words.min(words.len())).any(|count| {
-        let first = if at_end { words.len() - count } else { 0 };
-        (first..=words.len() - count)
-            .any(|start| sounds_like_trigger(&words[start..start + count].concat(), max_difference))
-    })
+/// How a trigger phrase sits in what was heard.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Ending {
+    /// Nothing was said after it.
+    Last,
+    /// Words follow, but much more quietly, so someone else said them.
+    BeforeBackground,
+}
+
+/// Finds a trigger phrase that finishes what was said in `audio`, as a spoken
+/// command does. "Diff clip that was the old phrase" doesn't count, because
+/// the same voice carries on.
+fn finished_phrase(words: &[Word], audio: &[f32]) -> Option<Ending> {
+    let (start, end) = *phrase_positions(words).last()?;
+    let Some(next) = words.get(end) else {
+        return Some(Ending::Last);
+    };
+    let sample = |seconds: f32| ((seconds * VOICE_SAMPLE_RATE as f32) as usize).min(audio.len());
+    let (phrase_start, phrase_end) = (
+        sample(words[start].start_seconds),
+        sample(next.start_seconds),
+    );
+    let phrase_level = speech_level(&audio[phrase_start.min(phrase_end)..phrase_end]);
+    let later_level = speech_level(&audio[phrase_end..]);
+    (phrase_level > 0.0 && later_level <= phrase_level * BACKGROUND_LEVEL)
+        .then_some(Ending::BeforeBackground)
 }
 
 /// Why the window is being read.
@@ -380,6 +408,7 @@ impl LightDetector {
         model_dir: &Path,
         score: f32,
         threshold: f32,
+        search_width: i32,
         keywords: Option<String>,
     ) -> Result<Self, VoiceError> {
         let mut config = KeywordSpotterConfig::default();
@@ -392,7 +421,7 @@ impl LightDetector {
         config.keywords_buf = Some(keywords.unwrap_or_else(|| KEYWORDS.into()));
         config.keywords_score = score;
         config.keywords_threshold = threshold;
-        config.max_active_paths = 4;
+        config.max_active_paths = search_width;
         config.num_trailing_blanks = 1;
 
         let spotter = KeywordSpotter::create(&config).ok_or(VoiceError::ModelUnavailable)?;
@@ -449,7 +478,7 @@ struct AccurateDetector {
 }
 
 impl AccurateDetector {
-    fn new(model_dir: &Path) -> Result<Self, VoiceError> {
+    fn new(model_dir: &Path, boost: f32, search_width: i32) -> Result<Self, VoiceError> {
         let mut config = OfflineRecognizerConfig::default();
         config.model_config.transducer.encoder = Some(model_file(model_dir, "encoder.int8.onnx")?);
         config.model_config.transducer.decoder = Some(model_file(model_dir, "decoder.int8.onnx")?);
@@ -457,7 +486,12 @@ impl AccurateDetector {
         config.model_config.tokens = Some(model_file(model_dir, "tokens.txt")?);
         config.model_config.num_threads = 1;
         config.model_config.provider = Some("cpu".into());
-        config.decoding_method = Some("greedy_search".into());
+        // Needed to turn the phrases into the pieces of words the model uses.
+        config.model_config.modeling_unit = Some("bpe".into());
+        config.model_config.bpe_vocab = Some(model_file(model_dir, "bpe.vocab")?);
+        config.decoding_method = Some("modified_beam_search".into());
+        config.max_active_paths = search_width;
+        config.hotwords_score = boost;
 
         let recognizer = OfflineRecognizer::create(&config).ok_or(VoiceError::ModelUnavailable)?;
         Ok(Self {
@@ -467,13 +501,25 @@ impl AccurateDetector {
         })
     }
 
-    fn transcribe(&self, audio: &[f32]) -> String {
-        let stream = self.recognizer.create_stream();
+    /// The words in `audio`. `boost` overrides the usual lean towards the
+    /// trigger phrases.
+    fn words(&self, audio: &[f32], boost: Option<f32>) -> Vec<Word> {
+        let phrases: Vec<String> = PHRASES
+            .iter()
+            .map(|phrase| match boost {
+                Some(boost) => format!("{phrase} :{boost}"),
+                None => phrase.to_string(),
+            })
+            .collect();
+        let audio = &audio[audio.len().saturating_sub(MAX_READ_SAMPLES)..];
+        let stream = self
+            .recognizer
+            .create_stream_with_hotwords(&phrases.join("/"));
         stream.accept_waveform(VOICE_SAMPLE_RATE as i32, audio);
         self.recognizer.decode(&stream);
         stream
             .get_result()
-            .map(|result| result.text)
+            .map(|result| words_from_tokens(&result.tokens, &result.timestamps.unwrap_or_default()))
             .unwrap_or_default()
     }
 
@@ -483,14 +529,18 @@ impl AccurateDetector {
         };
         let mut recent: Vec<f32> = self.window.audio.iter().copied().collect();
         normalize_speech(&mut recent);
-        let ends_with_phrase = transcript_has_trigger(
-            &self.transcribe(&recent),
-            true,
-            MAX_PHRASE_WORDS,
-            MAX_SOUND_DIFFERENCE,
-        );
-        let detected = ends_with_phrase && (read == Read::AfterPause || self.possible_phrase);
-        self.possible_phrase = ends_with_phrase && !detected;
+        let mut ending = finished_phrase(&self.words(&recent, None), &recent);
+        if ending.is_none() && read == Read::AfterPause && recent.len() > CLOSE_READ_SAMPLES {
+            let close = &recent[recent.len() - CLOSE_READ_SAMPLES..];
+            ending = finished_phrase(&self.words(close, None), close);
+        }
+        let detected = match (ending, read) {
+            (None, _) => false,
+            (Some(_), Read::AfterPause) | (Some(Ending::BeforeBackground), _) => true,
+            // The speaker may be carrying on, which the next read will show.
+            (Some(Ending::Last), Read::DuringSpeech) => self.possible_phrase,
+        };
+        self.possible_phrase = ending.is_some() && !detected;
         if detected {
             self.reset();
         }
@@ -503,10 +553,22 @@ impl AccurateDetector {
     }
 
     fn contains_phrase(&self, audio: &[f32]) -> bool {
-        let mut levelled = audio.to_vec();
-        normalize_speech(&mut levelled);
-        let text = self.transcribe(&levelled);
-        transcript_has_trigger(&text, false, MAX_PHRASE_WORDS, ECHO_SOUND_DIFFERENCE)
+        let heard = |audio: &[f32]| {
+            let mut levelled = audio.to_vec();
+            normalize_speech(&mut levelled);
+            !phrase_positions(&self.words(&levelled, Some(ECHO_PHRASE_BOOST))).is_empty()
+        };
+        // Anything longer than the model can take is read in overlapping
+        // stretches, so a phrase can't be lost across a join.
+        let step = MAX_READ_SAMPLES - WINDOW_SAMPLES;
+        let whole = (0..audio.len())
+            .step_by(step)
+            .any(|start| heard(&audio[start..(start + MAX_READ_SAMPLES).min(audio.len())]));
+        // The phrase the microphone just heard is at the end, so look there
+        // again on its own.
+        whole
+            || (audio.len() > CLOSE_READ_SAMPLES
+                && heard(&audio[audio.len() - CLOSE_READ_SAMPLES..]))
     }
 }
 
@@ -540,11 +602,14 @@ impl VoiceSpotter {
                 &models_dir.join("light"),
                 KEYWORDS_SCORE,
                 KEYWORDS_THRESHOLD,
+                KEYWORDS_SEARCH_WIDTH,
                 None,
             )?),
-            VoiceModel::Accurate => {
-                Detector::Accurate(AccurateDetector::new(&models_dir.join("accurate"))?)
-            }
+            VoiceModel::Accurate => Detector::Accurate(AccurateDetector::new(
+                &models_dir.join("accurate"),
+                PHRASE_BOOST,
+                SEARCH_WIDTH,
+            )?),
         };
         Ok(Self::with_detector(detector))
     }
@@ -555,10 +620,22 @@ impl VoiceSpotter {
         model_dir: &Path,
         score: f32,
         threshold: f32,
+        search_width: i32,
         keywords: Option<String>,
     ) -> Result<Self, VoiceError> {
-        let detector = LightDetector::new(model_dir, score, threshold, keywords)?;
+        let detector = LightDetector::new(model_dir, score, threshold, search_width, keywords)?;
         Ok(Self::with_detector(Detector::Light(detector)))
+    }
+
+    /// The accurate detector with an explicit lean towards the phrases, for
+    /// accuracy tests. `model_dir` is the accurate model's own folder.
+    pub fn accurate_with_tuning(
+        model_dir: &Path,
+        boost: f32,
+        search_width: i32,
+    ) -> Result<Self, VoiceError> {
+        let detector = AccurateDetector::new(model_dir, boost, search_width)?;
+        Ok(Self::with_detector(Detector::Accurate(detector)))
     }
 
     fn with_detector(detector: Detector) -> Self {
@@ -720,21 +797,53 @@ mod tests {
         assert_eq!(level.level, before);
     }
 
+    /// Words spaced half a second apart, as the model would report them.
+    fn heard(text: &str) -> Vec<Word> {
+        text.split(' ')
+            .filter(|word| !word.is_empty())
+            .enumerate()
+            .map(|(index, word)| Word {
+                text: word.to_string(),
+                start_seconds: index as f32 * 0.5,
+            })
+            .collect()
+    }
+
+    /// Audio with each half-second word of `levels` at the given level.
+    fn spoken(levels: &[f32]) -> Vec<f32> {
+        levels
+            .iter()
+            .flat_map(|level| [*level, -*level].repeat(VOICE_SAMPLE_RATE / 4))
+            .collect()
+    }
+
     #[test]
-    fn misheard_versions_of_the_phrase_match() {
+    fn pieces_of_words_are_joined_into_words() {
+        let tokens: Vec<String> = [" HE", "Y", " DI", "FF", " C", "LI", "P", " THAT"]
+            .iter()
+            .map(|token| token.to_string())
+            .collect();
+        let times = [0.1, 0.2, 0.4, 0.5, 0.7, 0.8, 0.9, 1.1];
+        let words = words_from_tokens(&tokens, &times);
+        let text: Vec<&str> = words.iter().map(|word| word.text.as_str()).collect();
+        assert_eq!(text, ["HEY", "DIFF", "CLIP", "THAT"]);
+        assert_eq!(words[1].start_seconds, 0.4);
+    }
+
+    #[test]
+    fn every_way_of_saying_the_phrase_matches() {
         for text in [
             "DIFF CLIP THAT",
             "HEY DIFF CLIP THAT",
-            "Diff, clip that.",
+            "diff clip that",
             "DIFF SAVE THAT",
             "DIFF CLIP IT",
-            "DEF CLIP THAT",
-            "DIVE CLIP THAT",
-            "IF CLIP THAT",
             "DIFF CLIPPED THAT",
+            "OH MY GOD DIFF CLIP THAT",
         ] {
-            assert!(
-                transcript_has_trigger(text, true, MAX_PHRASE_WORDS, MAX_SOUND_DIFFERENCE),
+            assert_eq!(
+                finished_phrase(&heard(text), &[]),
+                Some(Ending::Last),
                 "{text}"
             );
         }
@@ -746,33 +855,38 @@ mod tests {
             "",
             "CLIP THAT",
             "SAVE THAT",
-            "I NEED TO GO LEFT",
-            "THE DIFFERENCE BETWEEN THAT AND THIS",
+            "IF CLIP THAT",
+            "DID YOU CLIP THAT",
+            "DUDE CLIP THAT",
+            "THAT WAS DIFFICULT",
+            "IT'S A BIT DIFFERENT",
+            "THIS IS THE DEFAULT",
+            "THAT WAS THE FIRST",
+            "CARDIFF CLIP THAT",
+            "DIFF CLIP THAT'S",
             "NICE SHOT MAN THAT WAS REALLY CLOSE",
             "THAT WAS A DIFFICULT CLIP TO WATCH",
         ] {
-            assert!(
-                !transcript_has_trigger(text, true, MAX_PHRASE_WORDS, MAX_SOUND_DIFFERENCE),
-                "{text}"
-            );
+            assert!(phrase_positions(&heard(text)).is_empty(), "{text}");
         }
     }
 
     #[test]
-    fn at_end_requires_the_phrase_to_finish_the_transcript() {
-        let text = "DIFF CLIP THAT YESTERDAY WAS GREAT";
-        assert!(!transcript_has_trigger(
-            text,
-            true,
-            MAX_PHRASE_WORDS,
-            MAX_SOUND_DIFFERENCE
-        ));
-        assert!(transcript_has_trigger(
-            text,
-            false,
-            MAX_PHRASE_WORDS,
-            MAX_SOUND_DIFFERENCE
-        ));
+    fn a_phrase_the_speaker_carries_on_from_is_not_a_command() {
+        let words = heard("DIFF CLIP THAT YESTERDAY WAS GREAT");
+        assert_eq!(finished_phrase(&words, &spoken(&[0.1; 6])), None);
+        // The computer's own sound is checked for the phrase anywhere.
+        assert_eq!(phrase_positions(&words), [(0, 3)]);
+    }
+
+    #[test]
+    fn quieter_talk_after_a_phrase_is_background() {
+        let words = heard("DIFF CLIP THAT YESTERDAY WAS GREAT");
+        let audio = spoken(&[0.1, 0.1, 0.1, 0.02, 0.02, 0.02]);
+        assert_eq!(
+            finished_phrase(&words, &audio),
+            Some(Ending::BeforeBackground)
+        );
     }
 
     #[test]
